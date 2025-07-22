@@ -1,0 +1,358 @@
+---
+title: "Situación del suicidio en Santa Fe y Argentina"
+format:
+  html:
+    toc: true
+    page-layout: full
+    theme: cosmo
+editor: visual
+---
+
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(DT)
+library(plotly)
+library(sf)
+library(leaflet)
+library(rmapshaper)
+```
+
+```{r}
+base_arg <- read_excel("base_arg_2012_2022_X60_X84.xlsx")
+base_santa_fe <- read_excel("base_santa_fe_2012_2022_X60_X84.xlsx")
+poblacion <- read_excel("POBLACION.xlsx")
+departamentos_santa_fe <- read_excel("departamentos santa fe.xlsx")
+dtos_santa_fe <- st_read("santafe_deptos.shp")
+provincias <- st_read("Provincias.shp")
+intentos_de_suicidio <- read_excel("Intentos de suicidio.xlsx")
+pob_prov_2024 <- read_excel("pob_prov_2024.xlsx")
+
+
+```
+
+```{r}
+# Simplificar geometría (conservar 10% de los vértices)
+provincias <- ms_simplify(provincias, keep = 0.05, keep_shapes = TRUE)
+
+# Agrupar muertes por año
+def_arg <- base_arg %>%
+  group_by(ANO) %>%  
+  summarise(muertes = n(), .groups = "drop")  
+
+# Unir con población
+
+def_arg <- def_arg %>%
+  mutate(ANO = as.numeric(ANO))
+
+poblacion <- poblacion %>%
+  mutate(ANO = as.numeric(ANO))
+
+
+def_sf <- base_santa_fe %>%
+  group_by(ANO) %>%
+  summarise(muertes = n(), .groups = "drop")
+
+def_sf <- def_sf %>%
+  mutate(ANO = as.numeric(ANO))
+
+
+# Para Argentina
+arg_tasas <- def_arg %>%
+  left_join(poblacion, by = "ANO") %>%
+  mutate(tasa = (muertes / ARG) * 100000,
+         zona = "Argentina",
+         anio = ANO)  # Renombramos para que coincidan
+
+# Para Santa Fe
+sf <- def_sf %>%
+  left_join(poblacion, by = "ANO") %>%
+  mutate(tasa = (muertes / SFE) * 100000,
+         zona = "Santa Fe",
+         anio = ANO)
+
+# Combinamos correctamente
+tendencia <- bind_rows(arg_tasas, sf)
+
+# Total, promedio anual, diario, cada cuántas horas, tasa global
+
+resumen_arg <- def_arg %>%
+  summarise(
+    total = sum(muertes),
+    promedio_anual = round(mean(muertes), 0),
+    promedio_diario = round(mean(muertes) / 365, 0),
+    cada_horas = round(24 / (mean(muertes) / 365), 0)
+  )
+
+# Resumen Santa Fe
+resumen_sf <- def_sf %>%
+  summarise(
+    total = sum(muertes),
+    promedio_anual = round(mean(muertes), 0),
+    promedio_diario = round(mean(muertes) / 365, 0),
+    cada_horas = round(24 / (mean(muertes) / 365), 0)
+  )
+
+# Tasa ajustada acumulada Argentina
+tasa_acumulada_arg <- round((sum(def_arg$muertes) / sum(poblacion$ARG)) * 100000, 1)
+
+# Tasa ajustada acumulada Santa Fe
+tasa_acumulada_sf <- round((sum(def_sf$muertes) / sum(poblacion$SFE)) * 100000, 1)
+
+
+# Ajuste del modelo lineal para Argentina
+modelo_arg <- lm(tasa ~ anio, data = arg_tasas)
+summary(modelo_arg) # Para ver p-valor y coeficientes
+confint(modelo_arg, level = 0.95) # Intervalo de confianza 95%
+
+ # Ajuste del modelo lineal para Santa Fe
+modelo_sf <- lm(tasa ~ anio, data = sf)
+summary(modelo_sf)
+confint(modelo_sf, level = 0.95)
+
+
+# Calcular muertes por código
+muertes_total <- base_santa_fe %>%
+  filter(!is.na(DEPRES)) %>%
+  group_by(DEPRES) %>%
+  summarise(muertes_total = n(), .groups = "drop")
+
+poblacion_depto_sf_larga <- departamentos_santa_fe %>%
+  pivot_longer(cols = -Departamento, names_to = "anio", values_to = "poblacion") %>%
+  mutate(anio = as.numeric(anio))
+
+# Población acumulada 2012–2022 por departamento
+pob_total <- poblacion_depto_sf_larga %>%
+  group_by(Departamento) %>%
+  summarise(poblacion_total = sum(poblacion), .groups = "drop")
+
+
+# Tabla de equivalencia código - nombre
+departamentos_equivalencia <- tibble(
+  coddepto = c("007", "014", "021", "028", "035", "042", "049", "056", "063", "070",
+               "077", "084", "091", "098", "105", "112", "119", "126", "133"),
+  nombre_depto = c("Belgrano", "Caseros", "Castellanos", "Constitución", "Garay",
+                   "General López", "General Obligado", "Iriondo", "La Capital", "Las Colonias",
+                   "9 de Julio", "Rosario", "San Cristóbal", "San Javier", "San Jerónimo",
+                   "San Justo", "San Lorenzo", "San Martín", "Vera")
+)
+
+# Unir muertes con nombres
+tasas_departamento <- muertes_total %>%
+  left_join(departamentos_equivalencia, by = c("DEPRES" = "coddepto")) %>%
+  left_join(pob_total, by = c("nombre_depto" = "Departamento")) %>%
+  mutate(tasa = round((muertes_total / poblacion_total) * 100000, 1)) %>%
+  filter(!is.na(tasa))
+
+mapa_datos <- dtos_santa_fe %>%
+  left_join(tasas_departamento, by = c("nam" = "nombre_depto"))
+
+
+intentos_limpios <- intentos_de_suicidio %>%
+  filter(!Provincia %in% c("*sin dato*", "TOTAL")) %>%
+  mutate(Provincia = recode(Provincia,
+                            "CABA" = "Ciudad Autónoma de Buenos Aires",
+                            "Tierra del Fuego" = "Tierra del Fuego, Antártida e Islas del Atlántico Sur"
+  ))
+
+
+# Unir los datos de intentos de suicidio con el shapefile de provincias
+mapa_suicidio <- provincias %>%
+  left_join(intentos_limpios, by = c("NAME_1" = "Provincia"))
+
+pob_prov_2024_limpio <- pob_prov_2024 %>%
+  mutate(Provincias = recode(Provincias,
+                             "Ciudad de Buenos Aires" = "Ciudad Autónoma de Buenos Aires",
+                             "Tieera del Fuego" = "Tierra del Fuego, Antártida e Islas del Atlántico Sur"
+  ))
+
+intentos_con_tasa <- intentos_limpios %>%
+  left_join(pob_prov_2024_limpio, by = c("Provincia" = "Provincias")) %>%
+  mutate(Tasa_por_100k = (`Intento de Suicidio` / Poblacion) * 100000)
+
+intentos_con_tasa <- intentos_con_tasa %>%
+  mutate(
+    Provincia = case_when(
+      Provincia == "Ciudad Autónoma de Buenos Aires" ~ "Ciudad de Buenos Aires",
+      Provincia == "Tierra del Fuego, Antártida e Islas del Atlántico Sur" ~ "Tierra del Fuego",
+      TRUE ~ Provincia
+    )
+  )
+
+
+
+```
+
+## Tendencia nacional y provincial
+
+## Indicadores clave
+
+::: {.callout-note appearance="card"}
+**Argentina**\
+Total de suicidios: `r resumen_arg$total`\
+Tasa acumulada: `r tasa_acumulada_arg` por 100.000
+:::
+
+::: {.callout-important appearance="card"}
+**Santa Fe**\
+Total de suicidios: `r resumen_sf$total`\
+Tasa acumulada: `r tasa_acumulada_sf` por 100.000
+:::
+
+## Resumen general
+
+\`\`\`{r} paste0( "En Argentina, durante el período 2012--2022 se registraron", resumen_arg$total, " suicidios. Esto equivale a un promedio de ", resumen_arg$promedio_anual, " muertes por año, ", resumen_arg$promedio_diario, " por día y aproximadamente una cada ", resumen_arg$cada_horas," horas, con una tasa promedio de ", tasa_acumulada_arg," muertes por cada 100.000 habitantes." )
+
+## Variación Anual Promedio (VAP)
+
+```{r}
+paste0(
+  "La Variación Anual Promedio (VAP) de la tasa de suicidios en Argentina fue de ",
+  round(coef(modelo_arg)[["anio"]], 2), " por año ",
+  "(IC95%: ", round(confint(modelo_arg)["anio", 1], 2), " ; ", 
+  round(confint(modelo_arg)["anio", 2], 2), ", p = ", 
+  signif(summary(modelo_arg)$coefficients["anio", "Pr(>|t|)"], 3), "). ",
+  "Este resultado es estadísticamente significativo. ",
+  
+  "En cambio, en Santa Fe la VAP fue de ",
+  round(coef(modelo_sf)[["anio"]], 2), " por año ",
+  "(IC95%: ", round(confint(modelo_sf)["anio", 1], 2), " ; ",
+  round(confint(modelo_sf)["anio", 2], 2), ", p = ",
+  signif(summary(modelo_sf)$coefficients["anio", "Pr(>|t|)"], 3), "). ",
+  "Este resultado no es estadísticamente significativo."
+)
+```
+
+```{r}
+# Preparar datos escalados
+tasa_max <- max(tendencia$tasa)
+muertes_max <- max(tendencia$muertes)
+factor <- tasa_max / muertes_max
+
+tendencia <- tendencia %>%
+  mutate(muertes_esc = muertes * factor)
+
+# Gráfico interactivo
+plot_ly() %>%
+  add_bars(
+    data = tendencia,
+    x = ~anio,
+    y = ~muertes_esc,
+    name = ~paste("Casos -", zona),
+    color = ~zona,
+    colors = c("Argentina" = "steelblue", "Santa Fe" = "darkred"),
+    opacity = 0.7,
+    hoverinfo = "text",
+    text = ~paste("Año:", anio, "<br>Casos:", muertes, "<br>Tasa:", round(tasa, 1))
+  ) %>%
+  add_lines(
+    data = tendencia,
+    x = ~anio,
+    y = ~tasa,
+    name = ~paste("Tasa -", zona),
+    color = ~zona,
+    colors = c("Argentina" = "orange", "Santa Fe" = "lightcoral"),
+    line = list(width = 3)
+  ) %>%
+  layout(
+    title = "Tendencia de suicidios 2012–2022",
+    xaxis = list(title = "Año"),
+    yaxis = list(title = "Tasa por 100.000 hab."),
+    legend = list(orientation = "h", x = 0.1, y = -0.2)
+  )
+```
+
+## Tasa por departamento (Santa Fe)
+
+```{r}
+# Paleta de colores para la tasa
+pal <- colorNumeric(palette = "Reds", domain = mapa_datos$tasa)
+
+# Mapa interactivo
+leaflet(mapa_datos) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal(tasa),
+    fillOpacity = 0.7,
+    color = "#444",
+    weight = 1,
+    label = ~paste0(nam, "<br>Tasa: ", tasa),
+    highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE)
+  ) %>%
+  addLegend(pal = pal, values = ~tasa, title = "Tasa por 100.000")
+```
+
+## Intentos por provincia en 2024
+
+```{r}
+
+intentos_con_tasa %>%
+  arrange(Tasa_por_100k) %>%
+  plot_ly(
+    x = ~Tasa_por_100k,
+    y = ~reorder(Provincia, Tasa_por_100k),
+    type = "bar",
+    orientation = "h",
+    text = ~paste0("Provincia: ", Provincia, "<br>Intentos: ", `Intento de Suicidio`, "<br>Tasa: ", round(Tasa_por_100k, 1), " por 100.000"),
+    hoverinfo = "text",
+    marker = list(color = ~Tasa_por_100k, colorscale = "Reds", showscale = TRUE)
+  ) %>%
+  layout(
+    title = "Tasa e intentos de suicidio por provincia. Argentina, 2024",
+    xaxis = list(title = "Tasa por 100.000 habitantes"),
+    yaxis = list(title = "Provincia")
+  )
+
+
+# Unir los datos de intentos de suicidio con el shapefile de provincias
+mapa_suicidio <- provincias %>%
+  left_join(intentos_limpios, by = c("NAME_1" = "Provincia"))
+
+pob_prov_2024_limpio <- pob_prov_2024 %>%
+  mutate(Provincias = recode(Provincias,
+                             "Ciudad de Buenos Aires" = "Ciudad Autónoma de Buenos Aires",
+                             "Tieera del Fuego" = "Tierra del Fuego, Antártida e Islas del Atlántico Sur"
+  ))
+
+intentos_con_tasa <- intentos_limpios %>%
+  left_join(pob_prov_2024_limpio, by = c("Provincia" = "Provincias")) %>%
+  mutate(Tasa_por_100k = (`Intento de Suicidio` / Poblacion) * 100000)
+
+intentos_con_tasa <- intentos_con_tasa %>%
+  mutate(
+    Provincia = case_when(
+      Provincia == "Ciudad Autónoma de Buenos Aires" ~ "Ciudad de Buenos Aires",
+      Provincia == "Tierra del Fuego, Antártida e Islas del Atlántico Sur" ~ "Tierra del Fuego",
+      TRUE ~ Provincia
+    )
+  )
+
+mapa_tasa <- provincias %>%
+  left_join(intentos_con_tasa, by = c("NAME_1" = "Provincia"))
+
+# Paleta de colores para la tasa
+pal <- colorNumeric(palette = "Reds", domain = mapa_tasa$Tasa_por_100k)
+
+# Mapa interactivo
+leaflet(mapa_tasa) %>%  
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal(Tasa_por_100k),
+    fillOpacity = 0.7,
+    color = "#444",
+    weight = 1,
+    label = ~paste0(NAME_1, "<br>Tasa: ", Tasa_por_100k),
+    highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE)
+  ) %>%
+  addLegend(pal = pal, values = ~Tasa_por_100k, title = "Tasa por 100.000")
+
+
+```
+
+## Marco legal y fuentes
+
+-   Ley Nacional de Prevención del Suicidio N.º 27.130
+-   Ley Nacional de Salud Mental N.º 26.657
+-   Ley de Protección Integral de los Derechos de Niños, Niñas y Adolescentes N.º 26.061
+-   Datos de mortalidad: DEIS - Ministerio de Salud de la Nación
+-   Datos ambulatorios: SICAP - Ministerio de Salud de Santa Fe
